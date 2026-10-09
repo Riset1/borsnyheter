@@ -2,59 +2,6 @@
 
 Boten hämtar nyheter från svenska och amerikanska källor (plus Reddit), filtrerar bort brus och postar det intressanta i din Discord. Den körs gratis av GitHub Actions var 10:e minut. Ingen server behövs.
 
-## Vad du behöver
-- Ett Discord-konto med en egen server (där du är admin)
-- Ett gratis GitHub-konto (github.com)
-- Ca 15 minuter
-
----
-
-## Steg 1 – Skapa en webhook i Discord
-1. Öppna din Discord-server. Skapa gärna två textkanaler: `#nyheter` (allmänt, olja, guld, bitcoin) och `#bolagsnyheter`.
-2. Högerklicka på kanalen `#nyheter` → **Redigera kanal** → **Integrationer** → **Webhooks** → **Ny webhook**.
-3. Klicka på webhooken → **Kopiera webhook-URL**. Spara den tillfälligt i ett anteckningsblock. **Dela den aldrig med någon**, den fungerar som ett lösenord.
-4. (Valfritt) Gör samma sak för `#bolagsnyheter` och spara den URL:en separat.
-
-## Steg 2 – Skapa ett repo på GitHub
-1. Logga in på github.com → klicka **+** uppe till höger → **New repository**.
-2. Namn: `borsnyheter`.
-3. Välj **Public**. Det är viktigt, eftersom publika repon får obegränsad gratis körtid. Dina hemliga nycklar syns inte, de läggs i steg 4.
-4. Kryssa inte i några extra rutor, låt allt vara tomt. Klicka **Create repository**.
-
-## Steg 3 – Ladda upp filerna
-1. Packa upp zip-filen `borsnyheter.zip` på din dator.
-2. I ditt nya repo: klicka **uploading an existing file** (eller **Add file → Upload files**).
-3. Dra in **allt innehåll** från den uppackade mappen: `bot.py`, `config.py`, `bolag.txt`, `requirements.txt`, `seen.json`, `README.md`, `scanner.py`, `scanner_config.py`, `scanner_watchlist.txt`, `scanner_state.json`, `signals_log.json` **och mappen `.github`** (med två filer: `nyheter.yml` och `scanner.yml`). Om GitHub bara accepterar en fil åt gången i mappen `.github`, skapa dem en och en enligt nästa punkt.
-   - Mappen `.github` kan vara dold. På Windows: Visa → Visa → Dolda objekt. På Mac: Cmd + Shift + punkt.
-   - Om GitHub inte tar med mappen `.github` vid uppladdning: klicka **Add file → Create new file**, skriv `.github/workflows/nyheter.yml` som filnamn (snedstrecken skapar mapparna), klistra in innehållet från filen `nyheter.yml` och klicka **Commit changes**. Gör samma sak för `.github/workflows/scanner.yml`.
-4. Klicka **Commit changes**.
-
-## Steg 4 – Lägg in hemligheterna
-1. I repot: **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
-2. Skapa:
-   - Name: `DISCORD_WEBHOOK`, Secret: webhook-URL:en från steg 1.
-   - (Valfritt) Name: `DISCORD_WEBHOOK_BOLAG`, Secret: URL:en för `#bolagsnyheter`. Om du hoppar över den hamnar allt i samma kanal.
-   - (Valfritt) Name: `DISCORD_WEBHOOK_SCANNER`, URL:en för en egen kanal `#spike-skanner`. Hoppar du över den hamnar skannerns varningar i samma kanal som `DISCORD_WEBHOOK`.
-   - (Valfritt) Name: `GEMINI_API_KEY`, se steg 7.
-
-## Steg 5 – Ge Actions rätt att spara
-1. **Settings** → **Actions** → **General**.
-2. Scrolla ner till **Workflow permissions** → välj **Read and write permissions** → **Save**.
-
-## Steg 6 – Starta och testa
-1. Klicka på fliken **Actions**. Om GitHub frågar, klicka **I understand my workflows, enable them**.
-2. Välj **BörstNyheter** i listan till vänster → **Run workflow** → **Run workflow**.
-3. Vänta ca 1 minut, klicka på körningen och på **run**. Du ser loggen. Rader som `OK Yahoo Finance: 30 st` betyder att källan funkar. `SKIP` betyder att en källa inte gick att nå just nu (vanligt för Reddit), vilket inte är farligt.
-4. Kolla Discord. De första nyheterna ska dyka upp. Därefter körs det automatiskt var 10:e minut.
-
-## Steg 7 – (Valfritt) Gratis AI för bättre filter och svenska sammanfattningar
-1. Gå till aistudio.google.com och logga in med ett Google-konto.
-2. Klicka **Get API key** → skapa en nyckel → kopiera den.
-3. Lägg in den som secret `GEMINI_API_KEY` (steg 4).
-4. Då skriver Gemini en kort svensk sammanfattning, sorterar bort onödigt brus och flaggar nyheter där marknaden sannolikt redan rört sig (de får rubriken "🔴 Gamla nyheter 🔴").
-5. Om AI-delen slutar fungera kan modellnamnet ha bytts ut hos Google. Lägg då in en secret `GEMINI_MODEL` med ett aktuellt modellnamn från aistudio.google.com. Boten postar nyheter ändå, även om AI-delen failar.
-
----
 
 ## Anpassa
 - **Dina bolag**: öppna `bolag.txt` på GitHub (pennikonen), skriv ett bolag per rad och spara med **Commit changes**. Boten söker då specifikt efter dem, även amerikanska bolagsrapporter (SEC 8-K).
@@ -67,10 +14,6 @@ Boten hämtar nyheter från svenska och amerikanska källor (plus Reddit), filtr
 - **Körningarna slutar komma efter en tid**: GitHub pausar schemalagda körningar i repon som inte haft aktivitet på länge. Gå till **Actions** och klicka **Enable workflow**.
 - **För mycket spam**: minska `MAX_POSTS_PER_RUN` eller ta bort breda källor i `config.py`.
 - **Du missar nyheter**: körningarna kan försenas några minuter, och gratiskällor har ingen garanti för fullständighet. Boten är ett komplement till egen bevakning.
-
-## Viktigt
-- Detta är inga köp- eller säljrekommendationer. Rykten från sociala medier kan vara pumpningar.
-- Repot är publikt: dela aldrig webhook-URL:er eller API-nycklar i koden eller i chatten. Lägg dem bara som Secrets.
 
 ---
 
