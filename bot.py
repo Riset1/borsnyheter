@@ -25,8 +25,21 @@ SEEN_FILE = "seen.json"
 SEEN_MAX = 6000
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 
-WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
-WEBHOOK_BOLAG = os.getenv("DISCORD_WEBHOOK_BOLAG", "").strip() or WEBHOOK
+HOOK_RE = re.compile(r"^https://(?:[a-z]+\.)?discord(?:app)?\.com/api/webhooks/\d+/\S+$")
+
+
+def clean_hook(v):
+    """Tar bort mellanslag, radbrytningar och citattecken som ofta följer med vid kopiering."""
+    return (v or "").strip().strip("\"'").strip()
+
+
+WEBHOOK = clean_hook(os.getenv("DISCORD_WEBHOOK"))
+WEBHOOK_BOLAG = clean_hook(os.getenv("DISCORD_WEBHOOK_BOLAG"))
+if WEBHOOK_BOLAG and not HOOK_RE.match(WEBHOOK_BOLAG):
+    print("VARNING: DISCORD_WEBHOOK_BOLAG är ingen giltig webhook-adress, så bolagsnyheter går till huvudkanalen. "
+          "Ta bort den secreten eller klistra in rätt URL.", flush=True)
+    WEBHOOK_BOLAG = ""
+WEBHOOK_BOLAG = WEBHOOK_BOLAG or WEBHOOK
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
 
@@ -215,7 +228,11 @@ def post_discord(webhook, item, category, sentiment, summary, old=False):
         return True
 
     for _ in range(3):
-        r = requests.post(webhook, json=payload, timeout=20)
+        try:
+            r = requests.post(webhook, json=payload, timeout=20)
+        except requests.RequestException as ex:
+            log(f"  Kunde inte skicka till Discord: {ex}")
+            return False
         if r.status_code == 429:
             time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
             continue
@@ -231,6 +248,12 @@ def post_discord(webhook, item, category, sentiment, summary, old=False):
 def main():
     if not DRY_RUN and not WEBHOOK:
         log("FEL: Hemligheten DISCORD_WEBHOOK saknas. Se README.md, steg 4.")
+        sys.exit(1)
+    if not DRY_RUN and not HOOK_RE.match(WEBHOOK):
+        log("FEL: DISCORD_WEBHOOK är ingen giltig webhook-adress. Den ska se ut så här:\n"
+            "  https://discord.com/api/webhooks/123456789012345678/abcDEF...\n"
+            "Kopiera hela URL:en med 'Kopiera webhook-URL' i Discord (Redigera kanal > Integrationer > Webhooks) "
+            "och klistra in den som secret utan extra text, namn eller citattecken.")
         sys.exit(1)
 
     watch = load_watch()
