@@ -1,0 +1,11 @@
+# Aktier som skannern alltid ska analysera, utöver det Yahoo-screenern hittar.
+# En ticker per rad. Använd Yahoos tickers:
+#   USA:      WFF, TSLA, NVDA
+#   Sverige:  VOLV-B.ST, INVE-B.ST   (.ST)
+#   Norge:    EQNR.OL                (.OL)
+#   Danmark:  NOVO-B.CO              (.CO)
+#   Finland:  NOKIA.HE               (.HE)
+# Ta bort # för att aktivera en rad.
+#
+# WFF
+# INVE-B.ST

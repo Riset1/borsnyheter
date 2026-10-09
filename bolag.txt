@@ -1,0 +1,9 @@
+# Din bevakningslista – ett bolag per rad (max 30).
+# Boten söker då specifikt efter nyheter om dessa bolag och
+# visar även amerikanska bolagsrapporter (SEC 8-K) för dem.
+# Rader som börjar med # är kommentarer. Ta bort # för att aktivera.
+#
+# Investor
+# Volvo
+# Tesla
+# Nvidia
