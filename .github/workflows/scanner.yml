@@ -1,1 +1,41 @@
+name: Spike-skanner
 
+on:
+  schedule:
+    - cron: "*/5 6-23 * * 1-5"   # var 5:e minut under börs- och pre-markettid (UTC), vardagar
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: borstnyheter-git         # samma grupp som nyhetsboten, så de inte krockar när de sparar filer
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installera beroenden
+        run: pip install -r requirements.txt
+
+      - name: Kör skannern
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_SCANNER: ${{ secrets.DISCORD_WEBHOOK_SCANNER }}
+        run: python scanner.py
+
+      - name: Spara skannerns tillstånd och signallogg
+        run: |
+          git config user.name "borstnyheter-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add scanner_state.json signals_log.json
+          git diff --staged --quiet || (git commit -m "uppdatera skannerlogg" && git pull --rebase --autostash && git push)
