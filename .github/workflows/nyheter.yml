@@ -1,1 +1,43 @@
+name: BörstNyheter
 
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # var 10:e minut (GitHub kan försena några minuter)
+  workflow_dispatch:            # gör att du kan starta manuellt med en knapp
+
+permissions:
+  contents: write               # behövs för att spara seen.json
+
+concurrency:
+  group: borstnyheter-git
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installera beroenden
+        run: pip install -r requirements.txt
+
+      - name: Kör nyhetsboten
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_BOLAG: ${{ secrets.DISCORD_WEBHOOK_BOLAG }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+        run: python bot.py
+
+      - name: Spara vilka nyheter som skickats
+        run: |
+          git config user.name "borstnyheter-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || (git commit -m "uppdatera seen.json" && git pull --rebase --autostash && git push)
