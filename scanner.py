@@ -37,6 +37,11 @@ WEBHOOK = (os.getenv("DISCORD_WEBHOOK_SCANNER", "").strip()
 HEARTBEAT_MIN = getattr(sc, "HEARTBEAT_MIN", 60)
 RUN_STATS = {}      # statistik per marknad för den här körningen
 
+# Körs via knappen "Run workflow" i GitHub (eller med --test)? Då skickas alltid ett svar i kanalen.
+MANUAL = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or "--test" in sys.argv
+CHANNEL_SECRET = "DISCORD_WEBHOOK_SCANNER" if os.getenv("DISCORD_WEBHOOK_SCANNER", "").strip() else "DISCORD_WEBHOOK"
+WEEKDAYS = ["måndag", "tisdag", "onsdag", "torsdag", "fredag", "lördag", "söndag"]
+
 CHECKPOINTS = [(15, "15 min"), (30, "30 min"), (60, "1 tim"), (390, "dagens slut (~6,5 tim)"), (1440, "nästa dag (~24 tim)")]
 
 
@@ -525,6 +530,60 @@ def alert_embed(al, state):
     }
 
 
+def closed_reason(m, now_utc):
+    local = now_utc.astimezone(ZoneInfo(m["tz"]))
+    day = WEEKDAYS[local.weekday()]
+    if local.weekday() >= 5:
+        return f"stängd: helg ({day} {local:%H:%M} lokal tid)"
+    o, c = m["open"], m["close"]
+    return (f"stängd: utanför {o[0]:02d}:{o[1]:02d}-{c[0]:02d}:{c[1]:02d} "
+            f"({day} {local:%H:%M} lokal tid)")
+
+
+def why_nothing(opened, all_alerts, state):
+    """Förklarar på vanlig svenska varför inget varnades."""
+    if not opened:
+        return "Alla marknader är stängda just nu, så ingenting analyserades. Därför hittades inget."
+    reasons = []
+    for name in opened:
+        st = RUN_STATS.get(name, {})
+        status = state["data_status"].get(name, "OKÄND")
+        if status.startswith("EJ TILLGÄNGLIG"):
+            reasons.append(f"{name}: data saknas ({status}). Det går inte att skanna utan data.")
+        elif st.get("screener", 0) == 0:
+            reasons.append(f"{name}: screenern gav inga träffar, dvs. ingen aktie uppfyllde filtren just nu "
+                           f"(kursuppgång på minst {sc.MIN_CHANGE} % plus volym- och prisgränser).")
+        elif st.get("checked", 0) == 0:
+            reasons.append(f"{name}: {st['screener']} träffar i screenern, men ingen hade tillräckligt färsk minutdata.")
+        else:
+            reasons.append(f"{name}: {st['checked']} aktier analyserades, men ingen nådde varningsgränsen "
+                           f"på {sc.MIN_SCORE} poäng.")
+    return "\n".join(reasons)
+
+
+def manual_embed(now_utc, sent, all_alerts, opened, market_lines, state):
+    now_se = now_utc.astimezone(SE)
+    result = (f"{sent} varning(ar) skickades." if sent else "Skannern hittade ingen aktie att varna för.")
+    desc = f"Skannern kördes **manuellt** ({WEEKDAYS[now_se.weekday()]} {now_se:%H:%M} svensk tid). {result}"
+    if not sent:
+        desc += "\n\n**Varför:** " + why_nothing(opened, all_alerts, state)
+    if all_alerts and not sent:
+        best = max(all_alerts, key=lambda x: x["score"])
+        desc += (f"\nBästa kandidat: {best['symbol']} ({best['score']}/100, {', '.join(best['tags'])}).")
+    return {
+        "title": "🧪 Manuell körning av skannern",
+        "description": desc,
+        "color": 0x3498DB,
+        "fields": [
+            {"name": "Marknader", "value": "\n".join(market_lines)[:1000], "inline": False},
+            {"name": "Kanal", "value": f"Det här meddelandet skickades via secreten `{CHANNEL_SECRET}`. "
+                                       "Ser du det i rätt kanal är kopplingen korrekt.", "inline": False},
+        ],
+        "footer": {"text": "Vanliga körningar skickar bara varningar och en statusrad per timme."},
+        "timestamp": now_utc.isoformat(),
+    }
+
+
 def heartbeat_embed(opened, all_alerts, state):
     """Kort text som visar att skannern körs även när den inte hittat något."""
     lines, problems = [], []
@@ -640,13 +699,19 @@ def main():
         send_embed(report_embed(entries, state))
         return
 
+    if MANUAL and not DRY_RUN and not WEBHOOK:
+        log("FEL: ingen webhook hittades. Lägg in secreten DISCORD_WEBHOOK_SCANNER eller DISCORD_WEBHOOK.")
+        sys.exit(1)
+
     watch = load_watchlist()
-    all_alerts, opened = [], []
+    all_alerts, opened, market_lines = [], [], []
     for name, m in sc.MARKETS.items():
         if not market_open(m, now):
             log(f"[{name}] stängd just nu, hoppar över")
+            market_lines.append(f"**{name}**: {closed_reason(m, now)}")
             continue
         opened.append(name)
+        market_lines.append(f"**{name}**: öppen")
         try:
             all_alerts += scan_market(name, m, now, watch, state)
         except Exception as ex:
@@ -666,8 +731,12 @@ def main():
                             "market": al["market"], "price": al["a"]["last"], "score": al["score"],
                             "tags": al["tags"], "checks": {}})
 
+    # Manuell körning: skicka alltid ett svar så du ser att kanalen är rätt kopplad
+    if MANUAL:
+        if send_embed(manual_embed(now, sent, all_alerts, opened, market_lines, state)):
+            state["last_heartbeat"] = now.isoformat()
     # "Jag lever"-text: bara om marknader är öppna, inget varnats, och det var ett tag sedan sist
-    if sent > 0:
+    elif sent > 0:
         state["last_heartbeat"] = now.isoformat()
     elif opened and HEARTBEAT_MIN > 0:
         last = state.get("last_heartbeat")
