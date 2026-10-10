@@ -9,8 +9,57 @@ MAX_AGE_HOURS = 3
 # Max antal meddelanden per körning (skyddar mot att Discord blir översvämmat)
 MAX_POSTS_PER_RUN = 15
 
-# Max antal AI-anrop per körning (bara om du lagt in GEMINI_API_KEY)
-MAX_AI_CALLS = 12
+# ------------------------------------------------------------
+#  AI (Gemini) – gäller bara om du lagt in GEMINI_API_KEY
+#  Boten skickar ALLA nya nyheter i en enda förfrågan, inte en per nyhet.
+#  Google ändrar gratisgränserna ofta och publicerar dem inte längre öppet,
+#  så titta på dina egna gränser i aistudio.google.com.
+# ------------------------------------------------------------
+AI_DAILY_LIMIT = 60          # max antal AI-anrop per dygn (egen spärr, sänk om du får 429-fel)
+AI_MIN_INTERVAL_MIN = 20     # minst så här många minuter mellan AI-anrop (nyheter samlas ihop)
+AI_BATCH_MAX = 20            # max antal nyheter per AI-anrop
+AI_WAIT_MAX_MIN = 60         # nyheter väntar högst så här länge på AI, sen skickas de med nyckelordsfilter
+
+# ------------------------------------------------------------
+#  Mindre brus
+# ------------------------------------------------------------
+# Kategorier där bara tydligt positiva (🟢) eller negativa (🔴) nyheter visas, aldrig neutrala (⚪)
+SKIP_NEUTRAL_FOR = ["Bitcoin"]
+# Sätt till True om du vill dölja ALLA neutrala nyheter i alla kategorier
+SKIP_NEUTRAL_ALL = False
+# Max antal kryptonyheter per körning (gäller allt som handlar om krypto, oavsett källa)
+CRYPTO_MAX_PER_RUN = 2
+CRYPTO_WORDS = ["bitcoin", "btc", "krypto", "crypto", "ethereum", "ether ", "coinbase", "binance",
+                "solana", "xrp", "dogecoin", "stablecoin", "altcoin", "memecoin", "blockchain"]
+
+# Dubbletter: samma nyhet från olika källor/språk. Jämförs mot nyheter skickade de senaste X timmarna.
+DEDUPE_HOURS = 4
+# Begrepp som betyder samma sak på svenska och engelska (hjälper att hitta översatta dubbletter)
+CONCEPTS = {
+    "olja": ["olja", "oljepris", "oil", "crude", "brent", "opec"],
+    "guld": ["guld", "gold", "bullion"],
+    "ranta": ["ränta", "räntan", "räntor", "räntebesked", "interest rate", "rate cut", "rate hike", "rates"],
+    "inflation": ["inflation", "kpi", "cpi"],
+    "krig": ["krig", "war", "attack", "missil", "missile", "strike"],
+    "tullar": ["tullar", "tull ", "tariff"],
+    "vinstvarning": ["vinstvarning", "profit warning"],
+    "rapport": ["rapport", "earnings", "quarterly results", "kvartalsrapport"],
+    "forvarv": ["förvärv", "förvärvar", "acquires", "acquisition", "takeover", "köper upp"],
+    "utdelning": ["utdelning", "dividend"],
+    "riktkurs": ["riktkurs", "price target"],
+    "ai": ["artificiell intelligens", "ai-", " ai ", "chip", "halvledare", "semiconductor"],
+    "recession": ["recession", "lågkonjunktur"],
+    "prognos": ["prognos", "guidance", "outlook"],
+    "rekord": ["rekord", "record"],
+    "leveranser": ["leverans", "deliveries", "delivery"],
+    "order": ["order", "kontrakt", "contract"],
+    "vinst": ["vinst", "profit"],
+    "forlust": ["förlust", "loss"],
+    "omsattning": ["omsättning", "revenue", "sales"],
+    "nyemission": ["nyemission", "emission", "share offering", "stock offering"],
+    "konkurs": ["konkurs", "bankrupt", "bankruptcy"],
+    "arbetsloshet": ["arbetslöshet", "jobless", "unemployment", "payrolls"],
+}
 
 
 def gnews(query, sprak="sv"):
