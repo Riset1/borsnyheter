@@ -33,6 +33,10 @@ DRY_RUN = os.getenv("DRY_RUN") == "1"
 WEBHOOK = (os.getenv("DISCORD_WEBHOOK_SCANNER", "").strip()
            or os.getenv("DISCORD_WEBHOOK", "").strip())
 
+# Så ofta (minuter) en "jag lever"-text skickas när inga varningar hittats. 0 = aldrig.
+HEARTBEAT_MIN = getattr(sc, "HEARTBEAT_MIN", 60)
+RUN_STATS = {}      # statistik per marknad för den här körningen
+
 CHECKPOINTS = [(15, "15 min"), (30, "30 min"), (60, "1 tim"), (390, "dagens slut (~6,5 tim)"), (1440, "nästa dag (~24 tim)")]
 
 
@@ -367,9 +371,11 @@ def build_risks(a, spread, dilution, news, m, symbol, market):
 def scan_market(name, m, now_utc, watch, state):
     tz = ZoneInfo(m["tz"])
     quotes = {}
+    RUN_STATS[name] = {"screener": 0, "checked": 0}
     try:
         for q in screen_market(m):
             quotes[q["symbol"]] = q
+        RUN_STATS[name]["screener"] = len(quotes)
         log(f"[{name}] screener: {len(quotes)} träffar")
     except Exception as ex:
         log(f"[{name}] screenern misslyckades: {ex}")
@@ -405,6 +411,7 @@ def scan_market(name, m, now_utc, watch, state):
         a = analyze(df, q)
         if a is None or a["pct_day"] is None or a["bars_today"] < 5:
             continue
+        RUN_STATS[name]["checked"] += 1
         # Förfilter innan nyhetsanrop (sparar tid)
         pre, _, _ = score_signal(a, q, m, name, None)
         if pre < 30:
@@ -518,6 +525,32 @@ def alert_embed(al, state):
     }
 
 
+def heartbeat_embed(opened, all_alerts, state):
+    """Kort text som visar att skannern körs även när den inte hittat något."""
+    lines, problems = [], []
+    for name in opened:
+        st = RUN_STATS.get(name, {})
+        status = state["data_status"].get(name, "OKÄND")
+        if status.startswith("EJ TILLGÄNGLIG"):
+            problems.append(name)
+        lines.append(f"**{name}**: {st.get('screener', 0)} träffar i screenern, "
+                     f"{st.get('checked', 0)} analyserade · data: {status}")
+    if all_alerts:
+        best = max(all_alerts, key=lambda x: x["score"])
+        best_txt = (f"Bästa kandidat just nu: {best['symbol']} ({best['score']}/100, "
+                    f"{', '.join(best['tags'])}), under varningsgränsen {sc.MIN_SCORE}.")
+    else:
+        best_txt = "Inga aktier såg intressanta nog ut för att poängsättas."
+    title = "🔎 Skannern körs, inga varningar just nu"
+    color = 0x95A5A6
+    if problems:
+        title = f"⚠️ Skannern körs, men data saknas för: {', '.join(problems)}"
+        color = 0xE67E22
+    return {"title": title, "description": best_txt + "\n" + "\n".join(lines), "color": color,
+            "footer": {"text": f"Nästa statusrad om ca {HEARTBEAT_MIN} min om inget annat händer"},
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
 def should_alert(al, state, now_utc):
     if al["score"] < sc.MIN_SCORE:
         return False
@@ -608,11 +641,12 @@ def main():
         return
 
     watch = load_watchlist()
-    all_alerts = []
+    all_alerts, opened = [], []
     for name, m in sc.MARKETS.items():
         if not market_open(m, now):
             log(f"[{name}] stängd just nu, hoppar över")
             continue
+        opened.append(name)
         try:
             all_alerts += scan_market(name, m, now, watch, state)
         except Exception as ex:
@@ -631,6 +665,15 @@ def main():
             entries.append({"id": f"{al['symbol']}-{now:%Y%m%d%H%M}", "ts": now.isoformat(), "symbol": al["symbol"],
                             "market": al["market"], "price": al["a"]["last"], "score": al["score"],
                             "tags": al["tags"], "checks": {}})
+
+    # "Jag lever"-text: bara om marknader är öppna, inget varnats, och det var ett tag sedan sist
+    if sent > 0:
+        state["last_heartbeat"] = now.isoformat()
+    elif opened and HEARTBEAT_MIN > 0:
+        last = state.get("last_heartbeat")
+        due = (not last) or (now - datetime.fromisoformat(last)).total_seconds() / 60 >= HEARTBEAT_MIN - 2
+        if due and send_embed(heartbeat_embed(opened, all_alerts, state)):
+            state["last_heartbeat"] = now.isoformat()
 
     update_log(entries, now)
 
