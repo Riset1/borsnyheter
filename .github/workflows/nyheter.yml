@@ -9,7 +9,7 @@ permissions:
   contents: write               # behövs för att spara seen.json
 
 concurrency:
-  group: borstnyheter-git
+  group: borstnyheter-news
   cancel-in-progress: false
 
 jobs:
@@ -40,4 +40,5 @@ jobs:
           git config user.name "borstnyheter-bot"
           git config user.email "bot@users.noreply.github.com"
           git add seen.json
+          if [ -f bot_state.json ]; then git add bot_state.json; fi
           git diff --staged --quiet || (git commit -m "uppdatera seen.json" && git pull --rebase --autostash && git push)
