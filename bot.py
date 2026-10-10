@@ -43,6 +43,19 @@ CRYPTO_WORDS = getattr(config, "CRYPTO_WORDS", config.TOPIC_WORDS.get("Bitcoin",
 DEDUPE_HOURS = getattr(config, "DEDUPE_HOURS", 4)
 CONCEPTS = getattr(config, "CONCEPTS", {})
 
+# Guld (🟡) = extra bra nyhet. Titeln innehåller ett starkt ord, eller en positiv nyhet gäller ett bolag i bolag.txt.
+GOLD_STRONG_WORDS = getattr(config, "GOLD_STRONG_WORDS", [
+    "stororder", "ny order", "order på", "order värd", "tecknar order", "vinner order", "tilldelas",
+    "förvärvar", "uppköp", "uppköpsbud", "bud på", "budet", "bjuds ut",
+    "höjer prognos", "höjer riktkurs", "höjer målet", "rekordvinst", "rekordresultat", "överträffar",
+    "godkänn", "genombrott", "licensavtal", "partnerskap",
+    "raises guidance", "raises outlook", "raises forecast", "record profit", "record earnings",
+    "beats estimates", "beats expectations", "wins contract", "awarded contract", "contract win",
+    "fda approval", "fda approves", "approved by fda", "breakthrough", "acquires", "to acquire",
+    "takeover bid", "buyout", "upgraded to buy", "short squeeze",
+])
+GOLD_FOR_WATCHLIST = getattr(config, "GOLD_FOR_WATCHLIST", True)
+
 
 # ---------------------------------------------------------------- hjälpfunktioner
 def log(*a):
@@ -191,7 +204,7 @@ def classify(item, watch):
                 if has_word(text, words):
                     category = topic
                     break
-            if not category and has_word(text, config.EVENT_WORDS):
+            if not category and (has_word(text, config.EVENT_WORDS) or has_word(text, GOLD_STRONG_WORDS)):
                 category = "Bolag"
             if not category and has_word(text, config.MACRO_WORDS):
                 category = "Allmänt"
@@ -201,12 +214,27 @@ def classify(item, watch):
     title = item["title"].lower()
     pos_t, neg_t = has_word(title, config.POSITIVE_WORDS), has_word(title, config.NEGATIVE_WORDS)
     pos_s, neg_s = has_word(text, config.POSITIVE_WORDS), has_word(text, config.NEGATIVE_WORDS)
+    gold_t = has_word(title, GOLD_STRONG_WORDS)          # starka ord räknas alltid som positiva
+    pos_t = pos_t + [w for w in gold_t if w not in pos_t]
     pos = 2 * len(pos_t) + len(pos_s)
     neg = 2 * len(neg_t) + len(neg_s)
     sentiment = "positiv" if pos > neg else "negativ" if neg > pos else "neutral"
     info = {"pos": sorted(set(pos_t + pos_s)), "neg": sorted(set(neg_t + neg_s)), "watch": watch_hits,
             "events": has_word(text, config.EVENT_WORDS)[:3], "macro": has_word(text, config.MACRO_WORDS)[:3]}
     return category, sentiment, info
+
+
+def gold_reason(it):
+    """Returnerar en kort motivering om nyheten är extra bra (guld), annars None.
+    Gäller bara positiva nyheter, aldrig krypto och aldrig 'gamla nyheter'."""
+    if it["sent"] != "positiv" or it.get("crypto") or it.get("old"):
+        return None
+    hits = has_word(it["title"].lower(), GOLD_STRONG_WORDS)
+    if hits:
+        return f"starkt ord i rubriken: {hits[0]}"
+    if GOLD_FOR_WATCHLIST and it["info"]["watch"]:
+        return f"positiv nyhet om bevakat bolag: {it['info']['watch'][0]}"
+    return None
 
 
 def is_crypto(item):
@@ -384,6 +412,8 @@ def fallback_explain(it):
         why = "Ingen tydlig riktning i rubriken (automatisk bedömning utan AI)."
     else:
         why = f"Rubriken tyder på en {sent} nyhet (nyckelord: {', '.join(words[:4])}). Automatisk bedömning utan AI."
+    if it.get("gold"):
+        why += f" Extra bra: {it['gold']}."
     touched = [cat] + info["watch"] + info["events"] + info["macro"]
     return why, ", ".join(dict.fromkeys(touched)) + " (gissning från nyckelord)"
 
@@ -393,6 +423,9 @@ def post_discord(webhook, it):
     icon = {"positiv": "🟢", "negativ": "🔴"}.get(sent, "⚪")
     color = {"positiv": 0x2ECC71, "negativ": 0xE74C3C}.get(sent, 0x95A5A6)
     title = f"{icon} {it['title']}"
+    if it.get("gold"):
+        icon, color = "🟡", 0xF1C40F
+        title = f"🟡 {it['title']}"
     if it.get("old"):
         title = f"🔴 Gamla nyheter 🔴 {it['title']}"
         color = 0x992D22
@@ -540,6 +573,7 @@ def main():
             if res.get("sentiment") in ("positiv", "negativ", "neutral"):
                 it["sent"] = res["sentiment"]
             it["old"] = bool(res.get("gammal"))
+            it["gold"] = gold_reason(it)
             it["via_ai"] = True
         else:
             # Ingen AI för den här nyheten. Vänta på AI om det går, annars skicka med nyckelordsfilter.
@@ -547,6 +581,7 @@ def main():
             if GEMINI_KEY and status == "senare" and age_min < AI_WAIT_MAX_MIN:
                 wait_count += 1
                 continue                                 # inte markerad som sedd, tas om nästa körning
+            it["gold"] = gold_reason(it)
             it["varfor"], it["berorda"] = fallback_explain(it)
             it["via_ai"] = False
         to_post.append(it)
