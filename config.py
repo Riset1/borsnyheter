@@ -84,16 +84,15 @@ FEEDS = [
     {"namn": "Pressmeddelanden", "url": gnews("pressmeddelande bolagsstämma OR delårsrapport OR förvärv when:1d")},
 
     # --- Amerikanska / internationella källor ---
-    {"namn": "Yahoo Finance",   "url": "https://finance.yahoo.com/news/rssindex"},
+    {"namn": "Yahoo Finance",   "url": gnews("site:finance.yahoo.com when:1d", "en")},
     {"namn": "CNBC",            "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
     {"namn": "MarketWatch",     "url": "https://feeds.marketwatch.com/marketwatch/topstories/"},
     {"namn": "Reuters",         "url": gnews("site:reuters.com markets OR business when:1d", "en")},
     {"namn": "Bloomberg",       "url": gnews("site:bloomberg.com markets when:1d", "en")},
 
-    # --- Ämnen ---
+    # --- Ämnen (krypto är borttaget, lägg tillbaka en rad med topic "Bitcoin" om du vill ha det) ---
     {"namn": "Olja",    "url": gnews("olja OR oljepris OR \"oil price\" OR OPEC when:1d", "en"), "topic": "Olja"},
     {"namn": "Guld",    "url": gnews("guld OR guldpris OR \"gold price\" when:1d", "en"),       "topic": "Guld"},
-    {"namn": "Bitcoin", "url": gnews("bitcoin OR krypto OR \"crypto market\" when:1d", "en"),   "topic": "Bitcoin"},
 
     # --- Amerikanska bolagsrapporter (visas bara för bolag i bolag.txt) ---
     {"namn": "SEC 8-K",
@@ -102,7 +101,6 @@ FEEDS = [
 
     # --- Sociala medier (Reddit blockerar ibland GitHubs servrar, då hoppas de över) ---
     {"namn": "Reddit r/wallstreetbets", "url": "https://www.reddit.com/r/wallstreetbets/top/.rss?t=hour"},
-    {"namn": "Reddit r/stocks",         "url": "https://www.reddit.com/r/stocks/top/.rss?t=hour"},
 ]
 
 # ------------------------------------------------------------
