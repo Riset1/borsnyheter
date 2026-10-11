@@ -26,7 +26,7 @@ AI_WAIT_MAX_MIN = 60         # nyheter väntar högst så här länge på AI, se
 # Kategorier där bara tydligt positiva (🟢) eller negativa (🔴) nyheter visas, aldrig neutrala (⚪)
 SKIP_NEUTRAL_FOR = ["Bitcoin"]
 # Sätt till True om du vill dölja ALLA neutrala nyheter i alla kategorier
-SKIP_NEUTRAL_ALL = False
+SKIP_NEUTRAL_ALL = True
 # Max antal kryptonyheter per körning (gäller allt som handlar om krypto, oavsett källa)
 CRYPTO_MAX_PER_RUN = 2
 CRYPTO_WORDS = ["bitcoin", "btc", "krypto", "crypto", "ethereum", "ether ", "coinbase", "binance",
