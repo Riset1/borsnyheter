@@ -1,0 +1,21 @@
+# Profiler, investerare och institutioner som boten bevakar efter nya investeringar.
+# En per rad. Lägg flera namn på samma person/organisation med | emellan.
+# Lägg [sv] sist på raden för att söka i svenska nyheter i stället för engelska.
+# Max 25 rader. Rader som börjar med # är kommentarer.
+
+Warren Buffett | Berkshire Hathaway
+Donald Trump | Trump administration
+Nancy Pelosi
+Bill Ackman | Pershing Square
+Carl Icahn
+Cathie Wood | ARK Invest
+George Soros | Soros Fund Management
+Michael Burry
+Ray Dalio | Bridgewater
+BlackRock | Larry Fink
+Elon Musk
+Norges Bank Investment Management | oljefonden
+Saudi Public Investment Fund | PIF
+Wallenberg | Investor AB [sv]
+Industrivärden [sv]
+AP-fonden [sv]
