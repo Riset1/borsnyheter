@@ -1,41 +1,830 @@
-name: Spike-skanner
+#!/usr/bin/env python3
+"""
+Spike-skanner – letar aktier där volym, utbrott och nyheter börjar sammanfalla
+INNAN den stora rörelsen. Postar varningar i Discord.
 
-on:
-  schedule:
-    - cron: "*/5 6-23 * * 1-5"   # var 5:e minut under börs- och pre-markettid (UTC), vardagar
-  workflow_dispatch:
+Data: Yahoo Finance via biblioteket yfinance (gratis, inofficiellt).
+Körs av GitHub Actions (se .github/workflows/scanner.yml).
 
-permissions:
-  contents: write
+Testa lokalt utan att posta:   DRY_RUN=1 python scanner.py
+Skicka utvärderingsrapport nu: python scanner.py --rapport
+"""
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-concurrency:
-  group: borstnyheter-git         # samma grupp som nyhetsboten, så de inte krockar när de sparar filer
-  cancel-in-progress: false
+import pandas as pd
+import requests
+import yfinance as yf
+from yfinance import EquityQuery
 
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
+import bot                      # återanvänder hjälpfunktioner (ordmatchning, Google News)
+import config
+import scanner_config as sc
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+STATE_FILE = "scanner_state.json"
+LOG_FILE = "signals_log.json"
+WATCH_FILE = "scanner_watchlist.txt"
+SE = ZoneInfo("Europe/Stockholm")
+DRY_RUN = os.getenv("DRY_RUN") == "1"
+WEBHOOK = (os.getenv("DISCORD_WEBHOOK_SCANNER", "").strip()
+           or os.getenv("DISCORD_WEBHOOK", "").strip())
 
-      - name: Installera beroenden
-        run: pip install -r requirements.txt
+# Så ofta (minuter) en "jag lever"-text skickas när inga varningar hittats. 0 = aldrig.
+HEARTBEAT_MIN = getattr(sc, "HEARTBEAT_MIN", 60)
+RUN_STATS = {}      # statistik per marknad för den här körningen
 
-      - name: Kör skannern
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          DISCORD_WEBHOOK_SCANNER: ${{ secrets.DISCORD_WEBHOOK_SCANNER }}
-        run: python scanner.py
+# Spotlight Stock Market: Yahoos screener kan inte filtrera på Spotlight, så den läser en egen tickerlista.
+sc.MARKETS.setdefault("Spotlight", {
+    "tz": "Europe/Stockholm", "open": (8, 45), "close": (17, 45), "currency": "SEK",
+    "tickers_file": "spotlight_tickers.txt", "min_dayvolume": 5_000,
+    "min_turnover": 100_000, "good_turnover": 500_000,
+})
+SCANNED = set()      # tickers som redan analyserats i den här körningen (undviker dubbletter mellan marknader)
 
-      - name: Spara skannerns tillstånd och signallogg
-        run: |
-          git config user.name "borstnyheter-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add scanner_state.json signals_log.json
-          git diff --staged --quiet || (git commit -m "uppdatera skannerlogg" && git pull --rebase --autostash && git push)
+# Körs via knappen "Run workflow" i GitHub (eller med --test)? Då skickas alltid ett svar i kanalen.
+MANUAL = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or "--test" in sys.argv
+CHANNEL_SECRET = "DISCORD_WEBHOOK_SCANNER" if os.getenv("DISCORD_WEBHOOK_SCANNER", "").strip() else "DISCORD_WEBHOOK"
+WEEKDAYS = ["måndag", "tisdag", "onsdag", "torsdag", "fredag", "lördag", "söndag"]
+
+CHECKPOINTS = [(15, "15 min"), (30, "30 min"), (60, "1 tim"), (390, "dagens slut (~6,5 tim)"), (1440, "nästa dag (~24 tim)")]
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def fnum(x, dec=0):
+    if x is None:
+        return "OKÄND"
+    if abs(x) >= 1e9:
+        return f"{x / 1e9:.2f} mdr"
+    if abs(x) >= 1e6:
+        return f"{x / 1e6:.1f} mn"
+    return f"{x:,.{dec}f}".replace(",", " ")
+
+
+def pct(x):
+    return "OKÄND" if x is None else f"{x:+.1f}%"
+
+
+# ---------------------------------------------------------------- marknadstider
+def market_open(m, now_utc):
+    local = now_utc.astimezone(ZoneInfo(m["tz"]))
+    if local.weekday() >= 5:
+        return False
+    t = (local.hour, local.minute)
+    return m["open"] <= t <= m["close"]
+
+
+def market_of(symbol):
+    for suf, name in sc.SUFFIX_TO_MARKET.items():
+        if symbol.upper().endswith(suf):
+            return name
+    return "USA"
+
+
+# ---------------------------------------------------------------- hämta kandidater
+def load_watchlist():
+    out = []
+    try:
+        with open(WATCH_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if line:
+                    out.append(line.upper())
+    except FileNotFoundError:
+        pass
+    return out[:40]
+
+
+def read_ticker_file(path):
+    """Läser en tickerlista. 'BERG B' blir automatiskt Yahoo-tickern 'BERG-B.ST'."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                t = line.split("#")[0].strip().upper()
+                if not t:
+                    continue
+                if "." not in t:
+                    t = re.sub(r"\s+", "-", t) + ".ST"
+                out.append(t)
+    except FileNotFoundError:
+        pass
+    return list(dict.fromkeys(out))
+
+
+def file_universe(m, tz):
+    """Förfilter för marknader utan screener: dagsdata för hela listan, behåll de som rör sig eller har ovanlig volym.
+    Returnerar quote-liknande dictar (samma form som Yahoos screener)."""
+    symbols = read_ticker_file(m["tickers_file"])
+    if not symbols:
+        return []
+    raw = yf.download(tickers=" ".join(symbols), period="15d", interval="1d", group_by="ticker",
+                      progress=False, threads=True, auto_adjust=False)
+    out = []
+    if raw is None or raw.empty:
+        return out
+    today = datetime.now(tz).date()
+    for sym in symbols:
+        try:
+            df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+            df = df.dropna(subset=["Close"])
+            if len(df) < 3 or df.index[-1].date() != today:        # ingen handel idag = hoppa över
+                continue
+            last, prev = df.iloc[-1], df.iloc[-2]
+            chg = (float(last["Close"]) / float(prev["Close"]) - 1) * 100
+            avgv = float(df["Volume"].iloc[:-1].mean())
+            vol = float(last["Volume"])
+            rough = vol / avgv if avgv else 0
+            if (chg >= sc.MIN_CHANGE and vol >= m["min_dayvolume"]) or (rough >= 2.5 and chg >= 0):
+                out.append({"symbol": sym, "shortName": sym, "regularMarketVolume": vol,
+                            "averageDailyVolume3Month": avgv, "regularMarketPreviousClose": float(prev["Close"]),
+                            "currency": m["currency"]})
+        except Exception:
+            continue
+    return out
+
+
+def build_query(m):
+    conds = [
+        EquityQuery("is-in", ["exchange", *m["exchanges"]]),
+        EquityQuery("btwn", ["percentchange", sc.MIN_CHANGE, sc.MAX_CHANGE]),
+        EquityQuery("gt", ["dayvolume", m["min_dayvolume"]]),
+    ]
+    if m.get("price"):
+        conds.append(EquityQuery("btwn", ["intradayprice", *m["price"]]))
+    if m.get("mcap_max"):
+        conds.append(EquityQuery("lt", ["intradaymarketcap", m["mcap_max"]]))
+    return EquityQuery("and", conds)
+
+
+def screen_market(m):
+    """Frågar Yahoos screener efter aktier med kursuppgång och volym. Returnerar lista med quote-dictar."""
+    res = yf.screen(build_query(m), size=sc.SCREEN_SIZE, sortField="dayvolume", sortAsc=False)
+    return res.get("quotes", []) if isinstance(res, dict) else []
+
+
+def fetch_intraday(symbols, tz):
+    """Hämtar 5 dagars minutdata (inkl. pre/post-market). Returnerar {symbol: DataFrame i marknadens tidszon}."""
+    out = {}
+    if not symbols:
+        return out
+    raw = yf.download(tickers=" ".join(symbols), period="5d", interval="1m", prepost=True,
+                      group_by="ticker", progress=False, threads=True, auto_adjust=False)
+    if raw is None or raw.empty:
+        return out
+    for s in symbols:
+        try:
+            df = raw[s] if isinstance(raw.columns, pd.MultiIndex) else raw
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                continue
+            idx = df.index
+            idx = idx.tz_localize("UTC") if idx.tz is None else idx
+            df.index = idx.tz_convert(tz)
+            out[s] = df
+        except Exception:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------- nyheter
+def _parse_dt(v):
+    if not v:
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def fetch_news(symbol, name):
+    """Nyheter om bolaget: Yahoo först, Google News som reserv. Returnerar lista (nyast först)."""
+    items = []
+    try:
+        for n in yf.Ticker(symbol).news or []:
+            c = n.get("content") or n
+            title = c.get("title")
+            link = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+                    or n.get("link"))
+            pub = _parse_dt(c.get("pubDate") or c.get("displayTime") or n.get("providerPublishTime"))
+            src = (c.get("provider") or {}).get("displayName") or n.get("publisher") or "Yahoo Finance"
+            if title and link:
+                items.append({"title": title, "link": link, "published": pub, "source": src})
+    except Exception as ex:
+        log(f"  (Yahoo-nyheter för {symbol} misslyckades: {ex})")
+    if not items and name:
+        try:
+            feed = {"namn": "Google News", "url": config.gnews(f'"{name}" when:2d', "en")}
+            for it in bot.fetch_feed(feed):
+                items.append({"title": it["title"], "link": it["link"],
+                              "published": it["published"], "source": it["source"]})
+        except Exception as ex:
+            log(f"  (Google News för {symbol} misslyckades: {ex})")
+    items.sort(key=lambda x: x["published"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return items[:10]
+
+
+# ---------------------------------------------------------------- analys av minutdata
+def analyze(df, quote):
+    """Räknar ut volym, utbrott och kursförändringar. Returnerar dict eller None."""
+    df = df.copy()
+    last_ts = df.index[-1]
+    today = last_ts.date()
+    df["d"] = df.index.date
+    df["t"] = df.index.time
+    today_df = df[df["d"] == today]
+    prev_dates = sorted(d for d in df["d"].unique() if d < today)[-sc.RVOL_LOOKBACK_DAYS:]
+    last = float(today_df["Close"].iloc[-1])
+
+    prev_close = quote.get("regularMarketPreviousClose")
+    if not prev_close and prev_dates:
+        prev_close = float(df[df["d"] == prev_dates[-1]]["Close"].iloc[-1])
+    day_open = float(today_df["Open"].iloc[0])
+    ref = prev_close or day_open
+    pct_day = (last / ref - 1) * 100 if ref else None
+
+    def chg(minutes):
+        past = today_df["Close"][: last_ts - timedelta(minutes=minutes)]
+        p = float(past.iloc[-1]) if len(past) else day_open
+        return (last / p - 1) * 100 if p else None
+
+    today_vol = float(today_df["Volume"].sum())
+    avg3m = quote.get("averageDailyVolume3Month")
+    expected = []
+    for d in prev_dates:
+        sub = df[(df["d"] == d) & (df["t"] <= last_ts.time())]
+        expected.append(float(sub["Volume"].sum()))
+    rvol = None
+    if len(expected) >= 2:
+        exp = sum(expected) / len(expected)
+        floor = 0.02 * avg3m if avg3m else 1
+        rvol = today_vol / max(exp, floor, 1)
+
+    day_high = float(today_df["High"].max())
+    high_dist = (day_high - last) / day_high if day_high else 0
+
+    idx = today_df.index
+    win = today_df[(idx >= last_ts - timedelta(minutes=35)) & (idx < last_ts - timedelta(minutes=5))]
+    rec = today_df[idx >= last_ts - timedelta(minutes=5)]
+    prev5 = today_df[(idx >= last_ts - timedelta(minutes=10)) & (idx < last_ts - timedelta(minutes=5))]
+    breakout, false_breakout, vb, ref_high = False, False, None, None
+    if len(win) >= 8:
+        ref_high = float(win["High"].max())
+        breakout = last > ref_high * 1.001
+        r15 = today_df[idx >= last_ts - timedelta(minutes=15)]["Close"].max()
+        false_breakout = bool(r15 > ref_high * 1.003 and last < ref_high)
+        avg5 = float(win["Volume"].sum()) / (len(win) / 5)
+        vb = float(rec["Volume"].sum()) / max(avg5, 1)
+    v5, vp5 = float(rec["Volume"].sum()), float(prev5["Volume"].sum())
+    accel = (v5 / vp5) if vp5 > 0 else (None if v5 == 0 else 9.9)
+
+    # När började rörelsen? (första stapeln som är +2 % över gårdagens stängning)
+    move_start = None
+    if ref:
+        hit = today_df[today_df["Close"] >= ref * 1.02]
+        if len(hit):
+            move_start = hit.index[0]
+
+    return {
+        "last": last, "last_ts": last_ts, "pct_day": pct_day,
+        "pct1": chg(1), "pct5": chg(5), "pct15": chg(15),
+        "today_vol": today_vol, "rvol": rvol, "avg3m": avg3m,
+        "day_high": day_high, "high_dist": high_dist,
+        "breakout": breakout, "false_breakout": false_breakout, "vb": vb, "ref_high": ref_high,
+        "accel": accel, "move_start": move_start, "turnover": last * today_vol,
+        "bars_today": len(today_df),
+    }
+
+
+def news_info(news, a, now_utc):
+    """Väljer viktigaste nyheten och jämför tidpunkt med rörelsens start."""
+    if not news:
+        return None
+    best, best_rank = None, -1
+    for n in news:
+        if not n["published"]:
+            continue
+        age_h = (now_utc - n["published"]).total_seconds() / 3600
+        if age_h > 24 or age_h < -0.2:
+            continue
+        strong = bool(bot.has_word(n["title"].lower(), sc.STRONG_CATALYST_WORDS))
+        rank = (2 if strong else 1) * 100 - age_h
+        if rank > best_rank:
+            best, best_rank = dict(n, age_h=age_h, strong=strong), rank
+    if not best:
+        return None
+    timing, before = "Tidpunkt för rörelsestart OKÄND", None
+    if a["move_start"] is not None:
+        diff_min = (a["move_start"].astimezone(timezone.utc) - best["published"]).total_seconds() / 60
+        before = diff_min >= -5
+        if before:
+            timing = f"Nyheten kom ca {abs(diff_min):.0f} min före rörelsens start ({a['move_start']:%H:%M} lokal tid)"
+        else:
+            timing = (f"Nyheten kom ca {abs(diff_min):.0f} min EFTER att kursen började röra sig "
+                      f"({a['move_start']:%H:%M} lokal tid), kan vara en efterhandsförklaring")
+    best["timing"], best["before_move"] = timing, before
+    return best
+
+
+# ---------------------------------------------------------------- poäng och klassificering
+def score_signal(a, quote, m, cat, news):
+    parts = {}
+    # 1. Volym (25)
+    v, rv = 0, a["rvol"]
+    if rv is not None:
+        v = 20 if rv >= 5 else 16 if rv >= 3 else 11 if rv >= 2 else 5 if rv >= 1.5 else 0
+    if a["accel"] is not None and v > 0:
+        v += 5 if a["accel"] >= 2 else 3 if a["accel"] >= 1.3 else 0
+    parts["Volym"] = (min(v, 25), 25)
+    # 2. Utbrott med volymbekräftelse (20)
+    b = 0
+    if a["breakout"]:
+        b = 10 + (10 if (a["vb"] or 0) >= 1.5 else 5 if (a["vb"] or 0) >= 1 else 0)
+    parts["Utbrott"] = (b, 20)
+    # 3. Katalysator (20)
+    c = 0
+    if news:
+        c = 20 if news["strong"] and news["age_h"] <= 6 else 14 if news["strong"] else 10 if news["age_h"] <= 6 else 5
+        if news.get("before_move") is False:
+            c = c // 2
+    parts["Nyhet"] = (c, 20)
+    # 4. Tidigt skede (15)
+    d = a["pct_day"]
+    e = 0 if d is None or d < 0 else 15 if d <= 5 else 12 if d <= 10 else 8 if d <= 20 else 3 if d <= 30 else 0
+    parts["Tidigt"] = (e, 15)
+    # 5. Håller nivån (10)
+    h = 10 if a["breakout"] and a["high_dist"] <= 0.03 else 6 if a["high_dist"] <= 0.03 and (a["pct15"] or 0) > 0 \
+        else 3 if a["high_dist"] <= 0.06 else 0
+    parts["Håller"] = (h, 10)
+    # 6. Likviditet (10)
+    t = a["turnover"]
+    liq = 10 if t >= m["good_turnover"] else 6 if t >= m["min_turnover"] else 2 if t >= m["min_turnover"] / 3 else 0
+    spread = None
+    bid, ask = quote.get("bid"), quote.get("ask")
+    if bid and ask and bid > 0 and ask >= bid:
+        spread = (ask - bid) / ((ask + bid) / 2) * 100
+        if spread > sc.SPREAD_RISK_PCT:
+            liq = max(0, liq - 5)
+    parts["Likviditet"] = (liq, 10)
+    return sum(p[0] for p in parts.values()), parts, spread
+
+
+def classify(a, news, dilution, spread, m):
+    tags = []
+    d = a["pct_day"] or 0
+    if d >= 30 or (d >= 10 and a["high_dist"] >= 0.15):
+        tags.append("REDAN RUSAT")
+    if a["breakout"] and (a["rvol"] or 0) >= 2:
+        tags.append("UTBROTT PÅGÅR")
+    if (a["rvol"] or 0) >= 2 and d < 10:
+        tags.append("TIDIG SIGNAL")
+    if news and news["strong"] and news.get("before_move") is not False:
+        tags.append("NYHETSDRIVEN")
+    if not news and d >= 10:
+        tags.append("SPEKULATIV")
+    if dilution or (spread or 0) > sc.SPREAD_RISK_PCT or a["turnover"] < m["min_turnover"] or a["false_breakout"]:
+        tags.append("HÖG RISK")
+    return tags or ["BEVAKA"]
+
+
+def build_risks(a, spread, dilution, news, m, symbol, market):
+    r = []
+    if dilution:
+        r.append(f"Utspädningsrisk: nyhet nämner {', '.join(dilution[:3])}")
+    else:
+        r.append("Utspädning: OKÄND (SEC-filings/emissioner kontrolleras inte automatiskt)")
+    if spread is not None and spread > sc.SPREAD_RISK_PCT:
+        r.append(f"Stor spread ({spread:.1f}%)")
+    if a["turnover"] < m["min_turnover"]:
+        r.append("Låg omsättning, kan vara få affärer som driver kursen")
+    if a["false_breakout"]:
+        r.append("Falskt utbrott: har fallit tillbaka under brutet motstånd")
+    if a["accel"] is not None and a["accel"] < 0.7 and (a["pct5"] or 0) > 0:
+        r.append("Volymen avtar trots stigande kurs")
+    if a["high_dist"] >= 0.15:
+        r.append(f"Har fallit {a['high_dist'] * 100:.0f}% från dagens högsta")
+    if not news:
+        r.append("Ingen nyhet hittad: orsaken är EJ BEKRÄFTAD (spekulativ rörelse)")
+    return r
+
+
+# ---------------------------------------------------------------- skanna en marknad
+def scan_market(name, m, now_utc, watch, state):
+    tz = ZoneInfo(m["tz"])
+    quotes = {}
+    RUN_STATS[name] = {"screener": 0, "checked": 0}
+    try:
+        for q in (file_universe(m, tz) if m.get("tickers_file") else screen_market(m)):
+            quotes[q["symbol"]] = q
+        RUN_STATS[name]["screener"] = len(quotes)
+        log(f"[{name}] screener: {len(quotes)} träffar")
+    except Exception as ex:
+        log(f"[{name}] screenern misslyckades: {ex}")
+        state["data_status"][name] = f"EJ TILLGÄNGLIG (screener: {str(ex)[:60]})"
+
+    def rough(q):
+        v, av = q.get("regularMarketVolume"), q.get("averageDailyVolume3Month")
+        return (v / av) if v and av else 0
+
+    ranked = sorted(quotes.values(), key=rough, reverse=True)[: sc.MAX_CANDIDATES_PER_MARKET]
+    symbols = [q["symbol"] for q in ranked]
+    for w in watch:
+        if market_of(w) == name and w not in symbols:
+            symbols.append(w)
+    symbols = [x for x in symbols if x not in SCANNED]
+    SCANNED.update(symbols)
+    if not symbols:
+        state["data_status"].setdefault(name, "Inga kandidater i senaste körningen")
+        return []
+
+    data = fetch_intraday(symbols, tz)
+    if not data:
+        state["data_status"][name] = "EJ TILLGÄNGLIG (ingen minutdata kunde hämtas)"
+        return []
+
+    alerts, delays = [], []
+    for s in symbols:
+        df = data.get(s)
+        if df is None:
+            continue
+        q = quotes.get(s, {})
+        age_min = (now_utc - df.index[-1].astimezone(timezone.utc)).total_seconds() / 60
+        if age_min > sc.MAX_STALE_MIN:
+            continue
+        a = analyze(df, q)
+        if a is None or a["pct_day"] is None or a["bars_today"] < 5:
+            continue
+        RUN_STATS[name]["checked"] += 1
+        # Förfilter innan nyhetsanrop (sparar tid)
+        pre, _, _ = score_signal(a, q, m, name, None)
+        if pre < 30:
+            continue
+        cname = q.get("longName") or q.get("shortName") or s
+        news_list = fetch_news(s, cname)
+        news = news_info(news_list, a, now_utc)
+        titles = " ".join(n["title"].lower() for n in news_list)
+        dilution = bot.has_word(titles, sc.DILUTION_WORDS)
+        score, parts, spread = score_signal(a, q, m, name, news)
+        tags = classify(a, news, dilution, spread, m)
+        delay = q.get("exchangeDataDelayedBy")
+        if delay is not None:
+            delays.append(delay)
+        alerts.append({
+            "symbol": s, "name": cname, "market": name, "quote": q, "a": a, "score": score, "parts": parts,
+            "spread": spread, "tags": tags, "news": news, "dilution": dilution, "delay": delay,
+            "risks": build_risks(a, spread, dilution, news, m, s, name),
+        })
+
+    if delays:
+        state["data_status"][name] = "REALTID" if max(delays) == 0 else f"FÖRDRÖJD (ca {max(delays)} min)"
+    else:
+        state["data_status"][name] = "OKÄND fördröjning (Yahoo anger ingen)"
+    return alerts
+
+
+# ---------------------------------------------------------------- Discord
+def send_embed(embed):
+    if DRY_RUN:
+        log(f"[DRY] {embed['title']}")
+        for f in embed.get("fields", []):
+            log(f"      {f['name']}: {f['value']}")
+        return True
+    if not WEBHOOK:
+        log("FEL: DISCORD_WEBHOOK saknas")
+        return False
+    for _ in range(3):
+        r = requests.post(WEBHOOK, json={"username": "Spike-skanner", "embeds": [embed]}, timeout=20)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
+            continue
+        if r.status_code >= 400:
+            log(f"Discord-fel {r.status_code}: {r.text[:200]}")
+            return False
+        time.sleep(1)
+        return True
+    return False
+
+
+def alert_embed(al, state):
+    a, q, m = al["a"], al["quote"], sc.MARKETS[al["market"]]
+    cur = q.get("currency") or m["currency"]
+    ts_local = a["last_ts"]
+    ts_se = ts_local.astimezone(SE)
+    status = state["data_status"].get(al["market"], "OKÄND")
+    why = []
+    p = al["parts"]
+    if p["Volym"][0] >= 11:
+        why.append(f"ovanlig volym (RVOL {a['rvol']:.1f}, tidsjusterad)")
+    if a["breakout"]:
+        why.append("bryter över de senaste 30 minuternas högsta")
+    if al["news"]:
+        why.append("nyhet inom 24 tim")
+    if (a["pct_day"] or 0) < 10:
+        why.append(f"fortfarande tidigt ({pct(a['pct_day'])} idag)")
+    why_txt = ", ".join(why) or "flera svagare signaler sammanfaller"
+
+    news_txt = "Ingen nyhet hittad: SPEKULATIV RÖRELSE, ORSAK EJ BEKRÄFTAD (hypotes: momentum/låg likviditet)"
+    if al["news"]:
+        n = al["news"]
+        pub = n["published"].astimezone(ZoneInfo(m["tz"])).strftime("%d/%m %H:%M")
+        news_txt = f"[{n['title'][:140]}]({n['link']}) ({n['source']}, {pub} lokal tid)\n{n['timing']}"
+
+    strengthen = ["volymen fortsätter öka", "kursen bryter över dagens högsta " + f"{a['day_high']:.2f}"]
+    weaken = []
+    if a["ref_high"]:
+        weaken.append(f"faller tillbaka under {a['ref_high']:.2f} (utbrottsnivån)")
+    weaken += ["volymen avtar", "nyemission/utspädning offentliggörs"]
+
+    sym = al["symbol"]
+    edgar = (f" · [SEC-filings](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={sym}"
+             f"&type=424B&dateb=&owner=include&count=40)") if al["market"] == "USA" else ""
+    fields = [
+        {"name": "Kurs", "value": f"{a['last']:.2f} {cur}, senaste minutstapel {ts_local:%H:%M} lokal / "
+                                  f"{ts_se:%H:%M} svensk tid\nData: {status}", "inline": False},
+        {"name": "Förändring", "value": f"Dag {pct(a['pct_day'])} · 1 min {pct(a['pct1'])} · "
+                                         f"5 min {pct(a['pct5'])} · 15 min {pct(a['pct15'])}", "inline": False},
+        {"name": "Volym", "value": f"{fnum(a['today_vol'])} st · RVOL {('%.1f' % a['rvol']) if a['rvol'] else 'OKÄND'} · "
+                                    f"snitt/dag (3 mån) {fnum(a['avg3m'])}\nOmsättning ca {fnum(a['turnover'])} {cur}",
+         "inline": False},
+        {"name": "Börsvärde / Spread", "value": f"{fnum(q.get('marketCap'))} {cur if q.get('marketCap') else ''} · "
+                                                f"spread {('%.1f%%' % al['spread']) if al['spread'] is not None else 'OKÄND'}",
+         "inline": False},
+        {"name": "Katalysator", "value": news_txt[:1000], "inline": False},
+        {"name": "Risker", "value": "\n".join("• " + r for r in al["risks"])[:1000], "inline": False},
+        {"name": "Stärks av", "value": "• " + "\n• ".join(strengthen), "inline": True},
+        {"name": "Försvagas av", "value": "• " + "\n• ".join(weaken), "inline": True},
+        {"name": "Poäng", "value": " · ".join(f"{k} {v[0]}/{v[1]}" for k, v in al["parts"].items()), "inline": False},
+    ]
+    color = 0x2ECC71 if al["score"] >= 80 else 0xF1C40F
+    if "HÖG RISK" in al["tags"] or "REDAN RUSAT" in al["tags"]:
+        color = 0xE67E22
+    return {
+        "title": f"🚀 {sym} ({al['name'][:40]}) · {al['market']} · {al['score']}/100"[:256],
+        "url": f"https://finance.yahoo.com/quote/{sym}",
+        "description": f"**{' · '.join(al['tags'])}**\nVarför: {why_txt}{edgar}",
+        "color": color, "fields": fields,
+        "footer": {"text": "Ingen rekommendation. Poängen är en rangordning, inte en sannolikhet."},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def closed_reason(m, now_utc):
+    local = now_utc.astimezone(ZoneInfo(m["tz"]))
+    day = WEEKDAYS[local.weekday()]
+    if local.weekday() >= 5:
+        return f"stängd: helg ({day} {local:%H:%M} lokal tid)"
+    o, c = m["open"], m["close"]
+    return (f"stängd: utanför {o[0]:02d}:{o[1]:02d}-{c[0]:02d}:{c[1]:02d} "
+            f"({day} {local:%H:%M} lokal tid)")
+
+
+def why_nothing(opened, all_alerts, state):
+    """Förklarar på vanlig svenska varför inget varnades."""
+    if not opened:
+        return "Alla marknader är stängda just nu, så ingenting analyserades. Därför hittades inget."
+    reasons = []
+    for name in opened:
+        st = RUN_STATS.get(name, {})
+        status = state["data_status"].get(name, "OKÄND")
+        if status.startswith("EJ TILLGÄNGLIG"):
+            reasons.append(f"{name}: data saknas ({status}). Det går inte att skanna utan data.")
+        elif st.get("screener", 0) == 0:
+            reasons.append(f"{name}: screenern gav inga träffar, dvs. ingen aktie uppfyllde filtren just nu "
+                           f"(kursuppgång på minst {sc.MIN_CHANGE} % plus volym- och prisgränser).")
+        elif st.get("checked", 0) == 0:
+            reasons.append(f"{name}: {st['screener']} träffar i screenern, men ingen hade tillräckligt färsk minutdata.")
+        else:
+            reasons.append(f"{name}: {st['checked']} aktier analyserades, men ingen nådde varningsgränsen "
+                           f"på {sc.MIN_SCORE} poäng.")
+    return "\n".join(reasons)
+
+
+def manual_embed(now_utc, sent, all_alerts, opened, market_lines, state):
+    now_se = now_utc.astimezone(SE)
+    result = (f"{sent} varning(ar) skickades." if sent else "Skannern hittade ingen aktie att varna för.")
+    desc = f"Skannern kördes **manuellt** ({WEEKDAYS[now_se.weekday()]} {now_se:%H:%M} svensk tid). {result}"
+    if not sent:
+        desc += "\n\n**Varför:** " + why_nothing(opened, all_alerts, state)
+    if all_alerts and not sent:
+        best = max(all_alerts, key=lambda x: x["score"])
+        desc += (f"\nBästa kandidat: {best['symbol']} ({best['score']}/100, {', '.join(best['tags'])}).")
+    return {
+        "title": "🧪 Manuell körning av skannern",
+        "description": desc,
+        "color": 0x3498DB,
+        "fields": [
+            {"name": "Marknader", "value": "\n".join(market_lines)[:1000], "inline": False},
+            {"name": "Kanal", "value": f"Det här meddelandet skickades via secreten `{CHANNEL_SECRET}`. "
+                                       "Ser du det i rätt kanal är kopplingen korrekt.", "inline": False},
+        ],
+        "footer": {"text": "Vanliga körningar skickar bara varningar och en statusrad per timme."},
+        "timestamp": now_utc.isoformat(),
+    }
+
+
+def heartbeat_embed(opened, all_alerts, state):
+    """Kort text som visar att skannern körs även när den inte hittat något."""
+    lines, problems = [], []
+    for name in opened:
+        st = RUN_STATS.get(name, {})
+        status = state["data_status"].get(name, "OKÄND")
+        if status.startswith("EJ TILLGÄNGLIG"):
+            problems.append(name)
+        lines.append(f"**{name}**: {st.get('screener', 0)} träffar i screenern, "
+                     f"{st.get('checked', 0)} analyserade · data: {status}")
+    if all_alerts:
+        best = max(all_alerts, key=lambda x: x["score"])
+        best_txt = (f"Bästa kandidat just nu: {best['symbol']} ({best['score']}/100, "
+                    f"{', '.join(best['tags'])}), under varningsgränsen {sc.MIN_SCORE}.")
+    else:
+        best_txt = "Inga aktier såg intressanta nog ut för att poängsättas."
+    title = "🔎 Skannern körs, inga varningar just nu"
+    color = 0x95A5A6
+    if problems:
+        title = f"⚠️ Skannern körs, men data saknas för: {', '.join(problems)}"
+        color = 0xE67E22
+    return {"title": title, "description": best_txt + "\n" + "\n".join(lines), "color": color,
+            "footer": {"text": f"Nästa statusrad om ca {HEARTBEAT_MIN} min om inget annat händer"},
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+def should_alert(al, state, now_utc):
+    if al["score"] < sc.MIN_SCORE:
+        return False
+    if "REDAN RUSAT" in al["tags"] and al["score"] < sc.MIN_SCORE_ALREADY_RUSHED:
+        return False
+    prev = state["alerts"].get(al["symbol"])
+    if not prev:
+        return True
+    elapsed = (now_utc - datetime.fromisoformat(prev["ts"])).total_seconds() / 60
+    if elapsed >= sc.COOLDOWN_MIN:
+        return True
+    return al["score"] >= prev["score"] + 10 or ("UTBROTT PÅGÅR" in al["tags"] and "UTBROTT PÅGÅR" not in prev["tags"])
+
+
+# ---------------------------------------------------------------- utvärdering av signaler
+def update_log(entries, now_utc):
+    """Fyller i kursen 15/30/60 min, dagens slut och nästa dag för tidigare signaler."""
+    open_entries = [e for e in entries if not e.get("done")]
+    if not open_entries:
+        return
+    symbols = sorted({e["symbol"] for e in open_entries})
+    try:
+        raw = yf.download(tickers=" ".join(symbols), period="1d", interval="1m", prepost=True,
+                          group_by="ticker", progress=False, threads=True, auto_adjust=False)
+    except Exception as ex:
+        log(f"Utvärdering: kunde inte hämta kurser ({ex})")
+        return
+    last = {}
+    for s in symbols:
+        try:
+            df = raw[s] if isinstance(raw.columns, pd.MultiIndex) else raw
+            df = df.dropna(subset=["Close"])
+            if len(df):
+                last[s] = float(df["Close"].iloc[-1])
+        except Exception:
+            pass
+    for e in open_entries:
+        elapsed = (now_utc - datetime.fromisoformat(e["ts"])).total_seconds() / 60
+        for mins, _ in CHECKPOINTS:
+            key = str(mins)
+            if key in e["checks"]:
+                continue
+            if elapsed >= mins:
+                if elapsed <= mins + max(15, 0.5 * mins) and e["symbol"] in last:
+                    e["checks"][key] = last[e["symbol"]]
+                else:
+                    e["checks"][key] = None            # missade tidsfönstret
+        if len(e["checks"]) == len(CHECKPOINTS):
+            e["done"] = True
+
+
+def report_embed(entries, state):
+    lines = []
+    for mins, label in CHECKPOINTS:
+        rets = []
+        for e in entries:
+            v = e["checks"].get(str(mins))
+            if v is not None and e["price"]:
+                rets.append((v / e["price"] - 1) * 100)
+        if rets:
+            rets.sort()
+            up = sum(1 for r in rets if r > 0) / len(rets) * 100
+            med = rets[len(rets) // 2]
+            lines.append(f"**{label}**: {len(rets)} signaler · {up:.0f}% högre · median {med:+.1f}% · "
+                         f"snitt {sum(rets) / len(rets):+.1f}% · sämst {rets[0]:+.1f}% · bäst {rets[-1]:+.1f}%")
+    body = "\n".join(lines) or "För få utvärderade signaler än."
+    status = "\n".join(f"{k}: {v}" for k, v in state["data_status"].items()) or "OKÄND"
+    return {
+        "title": f"📊 Utvärdering av spike-signaler ({len(entries)} loggade)",
+        "description": body + "\n\n*Pris vid signal = senaste minutstapel, utan spread/slippage. "
+                             "Små urval säger lite, och resultatet visar inte framtida utfall.*",
+        "color": 0x3498DB,
+        "fields": [{"name": "Datastatus senaste körning", "value": status[:1000]}],
+    }
+
+
+# ---------------------------------------------------------------- huvudprogram
+def main():
+    now = datetime.now(timezone.utc)
+    state = load_json(STATE_FILE, {})
+    state.setdefault("alerts", {})
+    state.setdefault("data_status", {})
+    state.setdefault("last_report", "")
+    entries = load_json(LOG_FILE, [])
+
+    if "--rapport" in sys.argv:
+        send_embed(report_embed(entries, state))
+        return
+
+    if MANUAL and not DRY_RUN and not WEBHOOK:
+        log("FEL: ingen webhook hittades. Lägg in secreten DISCORD_WEBHOOK_SCANNER eller DISCORD_WEBHOOK.")
+        sys.exit(1)
+
+    watch = load_watchlist()
+    all_alerts, opened, market_lines = [], [], []
+    for name, m in sc.MARKETS.items():
+        if not market_open(m, now):
+            log(f"[{name}] stängd just nu, hoppar över")
+            market_lines.append(f"**{name}**: {closed_reason(m, now)}")
+            continue
+        if m.get("tickers_file") and not read_ticker_file(m["tickers_file"]):
+            log(f"[{name}] av: {m['tickers_file']} är tom")
+            market_lines.append(f"**{name}**: av ({m['tickers_file']} är tom)")
+            continue
+        opened.append(name)
+        market_lines.append(f"**{name}**: öppen")
+        try:
+            all_alerts += scan_market(name, m, now, watch, state)
+        except Exception as ex:
+            log(f"[{name}] fel: {ex}")
+            state["data_status"][name] = f"EJ TILLGÄNGLIG ({str(ex)[:60]})"
+
+    all_alerts.sort(key=lambda x: x["score"], reverse=True)
+    sent = 0
+    for al in all_alerts:
+        log(f"  {al['market']:8} {al['symbol']:10} poäng {al['score']:3} {','.join(al['tags'])}")
+        if sent >= sc.MAX_ALERTS_PER_RUN or not should_alert(al, state, now):
+            continue
+        if send_embed(alert_embed(al, state)):
+            sent += 1
+            state["alerts"][al["symbol"]] = {"ts": now.isoformat(), "score": al["score"], "tags": al["tags"]}
+            entries.append({"id": f"{al['symbol']}-{now:%Y%m%d%H%M}", "ts": now.isoformat(), "symbol": al["symbol"],
+                            "market": al["market"], "price": al["a"]["last"], "score": al["score"],
+                            "tags": al["tags"], "checks": {}})
+
+    # Manuell körning: skicka alltid ett svar så du ser att kanalen är rätt kopplad
+    if MANUAL:
+        if send_embed(manual_embed(now, sent, all_alerts, opened, market_lines, state)):
+            state["last_heartbeat"] = now.isoformat()
+    # "Jag lever"-text: bara om marknader är öppna, inget varnats, och det var ett tag sedan sist
+    elif sent > 0:
+        state["last_heartbeat"] = now.isoformat()
+    elif opened and HEARTBEAT_MIN > 0:
+        last = state.get("last_heartbeat")
+        due = (not last) or (now - datetime.fromisoformat(last)).total_seconds() / 60 >= HEARTBEAT_MIN - 2
+        if due and send_embed(heartbeat_embed(opened, all_alerts, state)):
+            state["last_heartbeat"] = now.isoformat()
+
+    update_log(entries, now)
+
+    # Daglig rapport efter 22:30 svensk tid
+    se_now = now.astimezone(SE)
+    if (se_now.hour, se_now.minute) >= (22, 30) and state["last_report"] != f"{se_now:%Y-%m-%d}" and entries:
+        if send_embed(report_embed(entries, state)):
+            state["last_report"] = f"{se_now:%Y-%m-%d}"
+
+    # Städa gamla poster
+    cutoff = now - timedelta(hours=6)
+    state["alerts"] = {k: v for k, v in state["alerts"].items() if datetime.fromisoformat(v["ts"]) > cutoff}
+    entries = entries[-600:]
+    log(f"Klart: {len(all_alerts)} analyserade, {sent} varningar skickade.")
+    if not DRY_RUN:
+        save_json(STATE_FILE, state)
+        save_json(LOG_FILE, entries)
+
+
+if __name__ == "__main__":
+    main()
