@@ -93,6 +93,12 @@ INVEST_FEEDS = getattr(config, "INVEST_FEEDS", [
 ])
 PROFILES = []       # fylls i från profiler.txt när boten startar
 
+# Statusmeddelanden: en kort "jag lever"-text i en kanal som varit tyst, och ett svar vid manuell körning.
+# NEWS_HEARTBEAT_MIN = så många minuter en kanal får vara tyst innan en statusrad skickas (0 = aldrig).
+NEWS_HEARTBEAT_MIN = getattr(config, "NEWS_HEARTBEAT_MIN", 60)
+MANUAL = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch" or "--test" in sys.argv
+ALL_CATS = ["Allmänt", "Bolag", "Investeringar", "Olja", "Guld", "Bitcoin"]
+
 
 # ---------------------------------------------------------------- hjälpfunktioner
 def log(*a):
@@ -540,6 +546,93 @@ def post_discord(webhook, it):
     return False
 
 
+# ---------------------------------------------------------------- statusmeddelanden
+def hook_for(cat):
+    """Vilken webhook (och vilken secret) en kategori postas via."""
+    if cat == "Bolag" and os.getenv("DISCORD_WEBHOOK_BOLAG", "").strip():
+        return WEBHOOK_BOLAG, "DISCORD_WEBHOOK_BOLAG"
+    if cat == "Investeringar" and os.getenv("DISCORD_WEBHOOK_INVEST", "").strip():
+        return WEBHOOK_INVEST, "DISCORD_WEBHOOK_INVEST"
+    return WEBHOOK, "DISCORD_WEBHOOK"
+
+
+def bump(stats, cat, key, n=1):
+    stats.setdefault(cat, {})
+    stats[cat][key] = stats[cat].get(key, 0) + n
+
+
+def status_embed(label, cats, stats, run, manual, now):
+    """Kort text om vad som hände i kanalen: hur många nyheter, varför inget postades och om källorna fungerar."""
+    lines, total_posted = [], 0
+    for c in cats:
+        st = stats.get(c, {})
+        total_posted += st.get("postade", 0)
+        if not st:
+            lines.append(f"**{c}**: inga nya kandidater")
+            continue
+        extra = []
+        if st.get("dubbletter"):
+            extra.append(f"{st['dubbletter']} dubbletter")
+        if st.get("neutral"):
+            extra.append(f"{st['neutral']} neutrala dolda")
+        if st.get("tak"):
+            extra.append(f"{st['tak']} över taket")
+        lines.append(f"**{c}**: {st.get('kandidater', 0)} kandidater, {st.get('postade', 0)} postade"
+                     + (f" ({', '.join(extra)})" if extra else ""))
+
+    why = []
+    if total_posted == 0:
+        if run["feed_ok"] == 0:
+            why.append("Alla källor misslyckades, så ingenting kunde hämtas.")
+        elif all(not stats.get(c) for c in cats):
+            why.append(f"Inga nya nyheter klarade filtren de senaste {config.MAX_AGE_HOURS} timmarna.")
+        if "Investeringar" in cats and run["rej_invest"]:
+            why.append(f"{run['rej_invest']} nya rubriker från investeringsflödena saknade investeringsord "
+                       "eller handlade inte om en investering.")
+        if any(stats.get(c, {}).get("neutral") for c in cats):
+            why.append("Neutrala nyheter döljs i den här kategorin.")
+    note = []
+    if label == "DISCORD_WEBHOOK" and "Investeringar" in cats and not os.getenv("DISCORD_WEBHOOK_INVEST", "").strip():
+        note.append("`DISCORD_WEBHOOK_INVEST` saknas, så investeringsnyheter postas i den här kanalen.")
+    if label == "DISCORD_WEBHOOK" and "Bolag" in cats and not os.getenv("DISCORD_WEBHOOK_BOLAG", "").strip():
+        note.append("`DISCORD_WEBHOOK_BOLAG` saknas, så bolagsnyheter postas i den här kanalen.")
+
+    src = f"Källor: {run['feed_ok']} fungerade"
+    if run["feed_fail"]:
+        src += f", {len(run['feed_fail'])} felade ({', '.join(run['feed_fail'][:3])})"
+    result = (f"{total_posted} nyhet(er) postades i den här kanalen." if total_posted
+              else "Inga nyheter postades i den här kanalen.")
+    desc = (f"{'Nyhetsboten kördes **manuellt**.' if manual else 'Nyhetsboten körs.'} {result}\n"
+            f"Totalt: {run['hamtade']} rubriker hämtade, {run['nya']} nya.\n\n" + "\n".join(lines))
+    if why:
+        desc += "\n\n**Varför inget:** " + " ".join(why)
+    fields = [{"name": "Källor", "value": src[:500], "inline": False},
+              {"name": "Kanal", "value": f"Skickat via secreten `{label}`." + (" " + " ".join(note) if note else ""),
+               "inline": False}]
+    return {"title": "🧪 Manuell körning av nyhetsboten" if manual else "🔎 Nyhetsboten körs, inga nya nyheter just nu",
+            "description": desc[:2000], "color": 0x3498DB if manual else 0x95A5A6, "fields": fields,
+            "footer": {"text": f"Statusrad högst en gång per {NEWS_HEARTBEAT_MIN} min i en tyst kanal"},
+            "timestamp": now.isoformat()}
+
+
+def send_status(url, embed):
+    if DRY_RUN:
+        log(f"[DRY-STATUS] {embed['title']}")
+        log("      " + embed["description"].replace("\n", "\n      "))
+        return True
+    for _ in range(3):
+        r = requests.post(url, json={"username": "BörstNyheter", "embeds": [embed]}, timeout=20)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
+            continue
+        if r.status_code >= 400:
+            log(f"  Discord-fel (status) {r.status_code}: {r.text[:200]}")
+            return False
+        time.sleep(1)
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- huvudprogram
 def main():
     if not DRY_RUN and not WEBHOOK:
@@ -558,13 +651,18 @@ def main():
 
     # 1. Hämta
     all_items = []
+    stats = {}
+    run = {"feed_ok": 0, "feed_fail": [], "rej_invest": 0, "hamtade": 0, "nya": 0}
     for feed in build_feeds(watch):
         try:
             got = fetch_feed(feed)
             log(f"OK   {feed['namn']}: {len(got)} st")
             all_items += got
+            run["feed_ok"] += 1
         except Exception as ex:
             log(f"SKIP {feed['namn']}: {ex}")
+            run["feed_fail"].append(feed["namn"])
+    run["hamtade"] = len(all_items)
 
     # 2. Filtrera bort gamla, redan sedda och exakta dubbletter
     fresh, run_keys = [], set()
@@ -578,14 +676,19 @@ def main():
         it["keys"] = (k1, k2)
         fresh.append(it)
 
+    run["nya"] = len(fresh)
+
     # 3. Klassificera
     candidates = []
     for it in fresh:
         cat, sent, info = classify(it, watch)
         if cat is None:
             seen += list(it["keys"])           # ointressant, kom ihåg så vi slipper kolla igen
+            if it["feed"].get("topic") == "Investeringar":
+                run["rej_invest"] += 1
             continue
         it["cat"], it["sent"], it["info"], it["crypto"] = cat, sent, info, is_crypto(it)
+        bump(stats, cat, "kandidater")
         candidates.append(it)
 
     # Nyast först
@@ -595,6 +698,7 @@ def main():
     candidates, dropped = dedupe_candidates(candidates, state["recent"])
     for it in dropped:
         seen += list(it["keys"])
+        bump(stats, it["cat"], "dubbletter")
     if dropped:
         log(f"Dubbletter borttagna: {len(dropped)}")
 
@@ -671,10 +775,12 @@ def main():
         if neutral and (SKIP_NEUTRAL_ALL or it["cat"] in SKIP_NEUTRAL_FOR or it["cat"] == "Investeringar"
                         or (it["crypto"] and "Bitcoin" in SKIP_NEUTRAL_FOR)):
             seen += list(it["keys"])
+            bump(stats, it["cat"], "neutral")
             continue
         if it["crypto"]:
             if crypto_n >= CRYPTO_MAX_PER_RUN:
                 seen += list(it["keys"])
+                bump(stats, it["cat"], "tak")
                 continue
             crypto_n += 1
         final.append(it)
@@ -686,11 +792,31 @@ def main():
     # 8. Posta
     posted = 0
     for it in final:
-        hook = WEBHOOK_BOLAG if it["cat"] == "Bolag" else WEBHOOK_INVEST if it["cat"] == "Investeringar" else WEBHOOK
+        hook = hook_for(it["cat"])[0]
         if post_discord(hook, it):
             posted += 1
+            bump(stats, it["cat"], "postade")
             seen += list(it["keys"])
             state["recent"].append({"t": it["title"], "c": it["cat"], "ts": now.isoformat()})
+
+    # Statusmeddelanden per kanal: vid manuell körning alltid, annars bara om kanalen varit tyst ett tag
+    groups = {}
+    for c in ALL_CATS:
+        url, label = hook_for(c)
+        groups.setdefault(label, {"url": url, "cats": []})["cats"].append(c)
+    last_signal = state.setdefault("last_signal", {})
+    for label, g in groups.items():
+        posted_here = sum(stats.get(c, {}).get("postade", 0) for c in g["cats"])
+        if posted_here:
+            last_signal[label] = now.isoformat()
+        send = False
+        if MANUAL:
+            send = True
+        elif NEWS_HEARTBEAT_MIN > 0 and not posted_here:
+            last = last_signal.get(label)
+            send = (not last) or (now - datetime.fromisoformat(last)).total_seconds() / 60 >= NEWS_HEARTBEAT_MIN - 2
+        if send and send_status(g["url"], status_embed(label, g["cats"], stats, run, MANUAL, now)):
+            last_signal[label] = now.isoformat()
 
     state["recent"] = state["recent"][-80:]
     log(f"Klart: {len(all_items)} hämtade, {len(fresh)} nya, {len(candidates)} efter dubblettkoll, {posted} postade.")
