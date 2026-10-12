@@ -31,6 +31,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_WEBHOOK_BOLAG: ${{ secrets.DISCORD_WEBHOOK_BOLAG }}
+          DISCORD_WEBHOOK_INVEST: ${{ secrets.DISCORD_WEBHOOK_INVEST }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
         run: python bot.py
