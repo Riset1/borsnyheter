@@ -1,1 +1,1 @@
-{"alerts": {}, "data_status": {"USA": "FÖRDRÖJD (ca 15 min)"}, "last_report": "", "last_heartbeat": "2026-10-10T18:43:20.629508+00:00"}
+{"alerts": {"WRT1V.HE": {"ts": "2026-10-12T13:03:33.487142+00:00", "score": 65, "tags": ["NYHETSDRIVEN"]}}, "data_status": {"USA": "OKÄND fördröjning (Yahoo anger ingen)", "Sverige": "REALTID", "Norge": "FÖRDRÖJD (ca 15 min)", "Danmark": "REALTID", "Finland": "REALTID"}, "last_report": "", "last_heartbeat": "2026-10-12T13:03:33.487142+00:00"}
