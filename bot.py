@@ -28,6 +28,7 @@ DRY_RUN = os.getenv("DRY_RUN") == "1"
 
 WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 WEBHOOK_BOLAG = os.getenv("DISCORD_WEBHOOK_BOLAG", "").strip() or WEBHOOK
+WEBHOOK_INVEST = os.getenv("DISCORD_WEBHOOK_INVEST", "").strip() or WEBHOOK
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
 
@@ -55,6 +56,42 @@ GOLD_STRONG_WORDS = getattr(config, "GOLD_STRONG_WORDS", [
     "takeover bid", "buyout", "upgraded to buy", "short squeeze",
 ])
 GOLD_FOR_WATCHLIST = getattr(config, "GOLD_FOR_WATCHLIST", True)
+
+# ------------------------------------------------------------
+#  INVESTERINGAR: nya investeringar från stora profiler, investerare, Trump, stater och fonder
+#  Profiler läggs i profiler.txt. Allmänna flöden och ord kan ändras här eller i config.py.
+# ------------------------------------------------------------
+INVEST_VERBS = getattr(config, "INVEST_VERBS", [
+    "stake", "invest", "buys", "bought", "buying", "acquir", "new position", "position in", "13f", "13d", "13g",
+    "funding", "loan", "grant", "bailout", "subsid", "award", "backs", "backing", "sells", "sold", "dumps", "exits",
+    "köper", "köpte", "investerar", "investering", "förvärv", "tar en post", "ökar", "minskar", "säljer", "lämnar",
+    "andel i", "ägarandel", "storägare", "går in i", "satsar",
+])
+INVEST_POS = getattr(config, "INVEST_POS", [
+    "takes stake", "new stake", "buys", "bought", "invests", "investing", "new position", "increases stake",
+    "boosts stake", "adds to", "backs", "equity stake", "funding", "award", "köper", "köpte", "investerar", "satsar",
+    "tar en post", "ökar sin", "ökar i", "går in i", "ägarandel",
+])
+INVEST_NEG = getattr(config, "INVEST_NEG", [
+    "sells stake", "sold stake", "dumps", "exits", "cuts stake", "reduces stake", "trims", "dumped", "divests",
+    "säljer", "sålde", "lämnar", "minskar", "avyttrar",
+])
+GOLD_FOR_PROFILES = getattr(config, "GOLD_FOR_PROFILES", True)
+INVEST_FEEDS = getattr(config, "INVEST_FEEDS", [
+    {"namn": "Stat/regering tar andel (USA)", "sprak": "en",
+     "q": '"equity stake" ("U.S. government" OR "Trump administration" OR Pentagon OR "Department of Energy") when:1d'},
+    {"namn": "Statliga satsningar (USA)", "sprak": "en",
+     "q": '(Pentagon OR "Department of Energy" OR "Commerce Department" OR "CHIPS Act") (invests OR award OR loan OR stake OR funding) company when:1d'},
+    {"namn": "Statsfonder", "sprak": "en",
+     "q": '("sovereign wealth fund" OR "Public Investment Fund" OR Mubadala OR "Norges Bank Investment") (stake OR invests OR buys) when:1d'},
+    {"namn": "Aktivister och nya poster", "sprak": "en",
+     "q": '("13D" OR "13F" OR "new stake" OR "takes stake" OR "activist investor") when:1d'},
+    {"namn": "Staten investerar (Sverige)", "sprak": "sv",
+     "q": '(staten OR regeringen OR AP-fonden OR Riksgälden) (investerar OR köper OR "går in" OR ägarandel) bolag when:1d'},
+    {"namn": "Storägare (Sverige)", "sprak": "sv",
+     "q": '(storägare OR "köper aktier" OR "tar en post" OR "ökar i") (Wallenberg OR Investor OR Industrivärden OR Lundbergs) when:1d'},
+])
+PROFILES = []       # fylls i från profiler.txt när boten startar
 
 
 # ---------------------------------------------------------------- hjälpfunktioner
@@ -141,6 +178,25 @@ def load_watch():
     return names[:30]
 
 
+def load_profiles():
+    """Läser profiler.txt. Format: 'Namn | alias | alias'. Lägg [sv] sist för svensk sökning. Max 25 rader."""
+    out = []
+    try:
+        with open("profiler.txt", encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#")[0].strip()
+                if not line:
+                    continue
+                sprak = "sv" if "[sv]" in line.lower() else "en"
+                line = re.sub(r"\[sv\]", "", line, flags=re.I).strip()
+                names = [n.strip() for n in line.split("|") if n.strip()]
+                if names:
+                    out.append({"names": names, "sprak": sprak})
+    except FileNotFoundError:
+        pass
+    return out[:25]
+
+
 # ---------------------------------------------------------------- hämtning
 def build_feeds(watch):
     feeds = list(config.FEEDS)
@@ -150,6 +206,14 @@ def build_feeds(watch):
             "url": config.gnews(f'"{name}" aktie OR stock OR shares when:1d', "sv"),
             "topic": "Bolag",
         })
+    for f in INVEST_FEEDS:
+        feeds.append({"namn": f"Invest: {f['namn']}", "url": config.gnews(f["q"], f["sprak"]),
+                      "topic": "Investeringar", "kräver": INVEST_VERBS})
+    for p in PROFILES:
+        names = " OR ".join(f'"{n}"' for n in p["names"])
+        q = f'({names}) (stake OR invests OR buys OR acquires OR "new position" OR investerar OR köper OR förvärvar) when:1d'
+        feeds.append({"namn": f"Profil: {p['names'][0]}", "url": config.gnews(q, p["sprak"]),
+                      "topic": "Investeringar", "kräver": INVEST_VERBS})
     return feeds
 
 
@@ -194,6 +258,8 @@ def classify(item, watch):
 
     if feed.get("bara_bevakade") and not watch_hits:
         return None, None, None
+    if feed.get("kräver") and not has_word(text, feed["kräver"]):
+        return None, None, None                      # inga investeringsord = ingen investeringsnyhet
 
     category = feed.get("topic")
     if not category:
@@ -218,8 +284,15 @@ def classify(item, watch):
     pos_t = pos_t + [w for w in gold_t if w not in pos_t]
     pos = 2 * len(pos_t) + len(pos_s)
     neg = 2 * len(neg_t) + len(neg_s)
+    if category == "Investeringar":                  # stora investerare som köper = positivt, säljer = negativt
+        ip, ineg = has_word(title, INVEST_POS), has_word(title, INVEST_NEG)
+        pos_t += [w for w in ip if w not in pos_t]
+        neg_t += [w for w in ineg if w not in neg_t]
+        pos += 2 * len(ip)
+        neg += 2 * len(ineg)
     sentiment = "positiv" if pos > neg else "negativ" if neg > pos else "neutral"
-    info = {"pos": sorted(set(pos_t + pos_s)), "neg": sorted(set(neg_t + neg_s)), "watch": watch_hits,
+    prof = [n for p in PROFILES for n in p["names"] if has_word(text, [n])][:2]
+    info = {"pos": sorted(set(pos_t + pos_s)), "neg": sorted(set(neg_t + neg_s)), "watch": watch_hits, "profiles": prof,
             "events": has_word(text, config.EVENT_WORDS)[:3], "macro": has_word(text, config.MACRO_WORDS)[:3]}
     return category, sentiment, info
 
@@ -229,6 +302,8 @@ def gold_reason(it):
     Gäller bara positiva nyheter, aldrig krypto och aldrig 'gamla nyheter'."""
     if it["sent"] != "positiv" or it.get("crypto") or it.get("old"):
         return None
+    if GOLD_FOR_PROFILES and it["cat"] == "Investeringar" and it["info"].get("profiles"):
+        return f"stor investerare går in: {it['info']['profiles'][0]}"
     hits = has_word(it["title"].lower(), GOLD_STRONG_WORDS)
     if hits:
         return f"starkt ord i rubriken: {hits[0]}"
@@ -414,7 +489,7 @@ def fallback_explain(it):
         why = f"Rubriken tyder på en {sent} nyhet (nyckelord: {', '.join(words[:4])}). Automatisk bedömning utan AI."
     if it.get("gold"):
         why += f" Extra bra: {it['gold']}."
-    touched = [cat] + info["watch"] + info["events"] + info["macro"]
+    touched = [cat] + info.get("profiles", []) + info["watch"] + info["events"] + info["macro"]
     return why, ", ".join(dict.fromkeys(touched)) + " (gissning från nyckelord)"
 
 
@@ -472,6 +547,7 @@ def main():
         sys.exit(1)
 
     now = now_utc()
+    PROFILES[:] = load_profiles()
     watch = load_watch()
     seen = load_seen()
     seen_set = set(seen)
@@ -592,7 +668,8 @@ def main():
     final, crypto_n = [], 0
     for it in to_post:
         neutral = it["sent"] == "neutral"
-        if neutral and (SKIP_NEUTRAL_ALL or it["cat"] in SKIP_NEUTRAL_FOR or (it["crypto"] and "Bitcoin" in SKIP_NEUTRAL_FOR)):
+        if neutral and (SKIP_NEUTRAL_ALL or it["cat"] in SKIP_NEUTRAL_FOR or it["cat"] == "Investeringar"
+                        or (it["crypto"] and "Bitcoin" in SKIP_NEUTRAL_FOR)):
             seen += list(it["keys"])
             continue
         if it["crypto"]:
@@ -609,7 +686,7 @@ def main():
     # 8. Posta
     posted = 0
     for it in final:
-        hook = WEBHOOK_BOLAG if it["cat"] == "Bolag" else WEBHOOK
+        hook = WEBHOOK_BOLAG if it["cat"] == "Bolag" else WEBHOOK_INVEST if it["cat"] == "Investeringar" else WEBHOOK
         if post_discord(hook, it):
             posted += 1
             seen += list(it["keys"])
