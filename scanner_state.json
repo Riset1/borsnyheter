@@ -1,1 +1,1 @@
-{"alerts": {"WALL-B.ST": {"ts": "2026-10-15T10:58:01.546300+00:00", "score": 75, "tags": ["UTBROTT PÅGÅR", "TIDIG SIGNAL"]}}, "data_status": {"USA": "FÖRDRÖJD (ca 20 min)", "Sverige": "REALTID", "Norge": "FÖRDRÖJD (ca 15 min)", "Danmark": "REALTID", "Finland": "REALTID"}, "last_report": "", "last_heartbeat": "2026-10-15T15:33:54.915040+00:00"}
+{"alerts": {}, "data_status": {"USA": "FÖRDRÖJD (ca 20 min)", "Sverige": "REALTID", "Norge": "FÖRDRÖJD (ca 15 min)", "Danmark": "REALTID", "Finland": "REALTID"}, "last_report": "", "last_heartbeat": "2026-10-15T19:22:20.018365+00:00"}
